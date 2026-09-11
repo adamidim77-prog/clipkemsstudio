@@ -1,129 +1,100 @@
 import { supabaseServer } from "../../../lib/supabaseClient";
 
-// Ambil potongan kata-kata transcript yang berada di rentang [startMs, endMs].
-// Inilah yang membuat hook/title dibuat dari transkrip ASLI klip itu, bukan tebakan LLM.
-function sliceTranscript(words, startMs, endMs) {
-  return words
-    .filter((w) => w.start >= startMs && w.end <= endMs)
-    .map((w) => w.text)
-    .join(" ");
+// Bangun URL subtitle .srt sederhana dari word-level timestamps di rentang klip.
+function buildSrt(words, startMs, endMs) {
+  const clipWords = words.filter((w) => w.start >= startMs && w.end <= endMs);
+  let srt = "";
+  let idx = 1;
+  // Kelompokkan jadi baris ~6 kata biar subtitle enak dibaca (dua baris pendek)
+  for (let i = 0; i < clipWords.length; i += 6) {
+    const chunk = clipWords.slice(i, i + 6);
+    const lineStart = chunk[0].start - startMs;
+    const lineEnd = chunk[chunk.length - 1].end - startMs;
+    const text = chunk.map((w) => w.text).join(" ");
+    srt += `${idx}\n${msToSrtTime(lineStart)} --> ${msToSrtTime(lineEnd)}\n${text}\n\n`;
+    idx++;
+  }
+  return srt;
+}
+
+function msToSrtTime(ms) {
+  const h = String(Math.floor(ms / 3600000)).padStart(2, "0");
+  const m = String(Math.floor((ms % 3600000) / 60000)).padStart(2, "0");
+  const s = String(Math.floor((ms % 60000) / 1000)).padStart(2, "0");
+  const msRem = String(ms % 1000).padStart(3, "0");
+  return `${h}:${m}:${s},${msRem}`;
 }
 
 export async function POST(req) {
-  const { projectId } = await req.json();
+  const { clipId } = await req.json();
   const db = supabaseServer();
 
   try {
-    const { data: project } = await db
-      .from("projects")
-      .select("*")
-      .eq("id", projectId)
-      .single();
+    const { data: clip } = await db.from("clips").select("*, projects(*)").eq("id", clipId).single();
+    if (!clip) throw new Error("Klip tidak ditemukan.");
 
-    if (!project?.transcript?.words?.length) {
-      throw new Error("Transkrip belum tersedia untuk proyek ini.");
-    }
+    const words = clip.projects.transcript.words;
+    const cloud = process.env.CLOUDINARY_CLOUD_NAME;
 
-    const { words, full_text } = project.transcript;
+    // 1) Upload .srt subtitle ke Cloudinary (raw file) supaya bisa dipakai transformasi l_subtitles
+    const srtContent = buildSrt(words, clip.start_ms, clip.end_ms);
+    const srtUpload = await uploadRawToCloudinary(srtContent, `srt_${clipId}`);
 
-    // 1) Minta LLM mengusulkan kandidat momen viral (hanya timestamp + alasan, TANPA judul dulu)
-    const candidatesRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1500,
-        messages: [
-          {
-            role: "user",
-            content: `Berikut transkrip lengkap sebuah video (Bahasa Indonesia):\n\n"""${full_text}"""\n\nUsulkan 3-6 momen (durasi 20-90 detik) yang paling berpotensi viral untuk TikTok/Reels/Shorts. Balas HANYA JSON array, format: [{"start_hint": "kutipan kalimat awal momen", "end_hint": "kutipan kalimat akhir momen", "reason": "alasan singkat kenapa menarik"}]. Jangan tambahkan teks lain di luar JSON.`,
-          },
-        ],
-      }),
-    });
+    // 2) Susun transformasi Cloudinary:
+    //    - trim ke rentang klip
+    //    - reframe 9:16 pakai gravity:auto (content-aware; PERINGATAN JUJUR di bawah)
+    //    - overlay subtitle dari file .srt yang baru diupload, font proporsional (~128px di kanvas 1080x1920)
+    const startSec = (clip.start_ms / 1000).toFixed(2);
+    const durationSec = ((clip.end_ms - clip.start_ms) / 1000).toFixed(2);
 
-    const candidatesData = await candidatesRes.json();
-    const rawText = candidatesData.content?.[0]?.text || "[]";
-    const candidates = JSON.parse(rawText.replace(/```json|```/g, "").trim());
+    const transformation = [
+      `so_${startSec},du_${durationSec}`, // potong sesuai rentang klip
+      "ar_9:16,c_fill,g_auto", // reframe cover 9:16, gravity otomatis mengikuti area menarik
+      `l_subtitles:${srtUpload.public_id},co_white,so_-200`, // overlay subtitle
+    ].join("/");
 
-    const clipsToInsert = [];
+    const renderUrl = `https://res.cloudinary.com/${cloud}/video/upload/${transformation}/${clip.projects.video_public_id}.mp4`;
 
-    for (const c of candidates) {
-      // Cari posisi kutipan di dalam array kata untuk dapat timestamp asli
-      const startWord = words.find((w) =>
-        c.start_hint && full_text.includes(c.start_hint) ? true : false
-      );
-      // Pendekatan sederhana: cari index kata pertama & terakhir dari hint di full_text,
-      // lalu petakan ke words[] berdasarkan urutan karakter. Untuk produksi, pertimbangkan
-      // fuzzy matching yang lebih robust.
-      const startIdx = full_text.indexOf(c.start_hint);
-      const endIdx = full_text.indexOf(c.end_hint) + (c.end_hint?.length || 0);
-      if (startIdx === -1 || endIdx === -1) continue;
+    // 3) Verifikasi render benar-benar tersedia (bukan asumsi jadi)
+    const check = await fetch(renderUrl, { method: "HEAD" });
 
-      // Perkirakan timestamp berdasar proporsi posisi karakter terhadap durasi total kata
-      const totalChars = full_text.length;
-      const firstWordMs = words[0]?.start || 0;
-      const lastWordMs = words[words.length - 1]?.end || 0;
-      const totalMs = lastWordMs - firstWordMs;
-
-      const startMs = firstWordMs + Math.floor((startIdx / totalChars) * totalMs);
-      const endMs = firstWordMs + Math.floor((endIdx / totalChars) * totalMs);
-
-      const clipTranscript = sliceTranscript(words, startMs, endMs);
-      if (!clipTranscript) continue;
-
-      // 2) Generate hook/title dari TEKS ASLI klip ini (bukan dari transkrip penuh)
-      const hookRes = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": process.env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 200,
-          messages: [
-            {
-              role: "user",
-              content: `Ini transkrip PERSIS dari satu klip video (Bahasa Indonesia):\n\n"""${clipTranscript}"""\n\nBuat 1 judul/hook pendek (maks 12 kata) yang menarik untuk klip ini, HARUS berdasarkan isi transkrip di atas, jangan mengarang di luar konteksnya. Balas hanya teks judulnya saja.`,
-            },
-          ],
-        }),
-      });
-      const hookData = await hookRes.json();
-      const hookTitle = hookData.content?.[0]?.text?.trim();
-
-      clipsToInsert.push({
-        project_id: projectId,
-        start_ms: startMs,
-        end_ms: endMs,
-        clip_transcript: clipTranscript, // provenance — bukti hook dibuat dari transkrip asli
-        hook_title: hookTitle,
-        viral_reason: c.reason,
-        render_status: "pending",
-      });
-    }
-
-    if (clipsToInsert.length === 0) {
+    if (!check.ok) {
       throw new Error(
-        "Tidak ada momen yang berhasil dipetakan ke timestamp. Coba video dengan transkrip lebih jelas."
+        `Render belum tersedia (status ${check.status}). PERHATIAN: gravity_auto Cloudinary adalah content-aware cropping, BUKAN face-tracking dinamis per-frame sungguhan. Untuk face-tracking asli, perlu integrasi provider khusus (misal Replicate/Modal dengan model face-tracking) — belum terpasang di kode ini.`
       );
     }
 
-    await db.from("clips").insert(clipsToInsert);
-    await db.from("projects").update({ status: "moments_detected" }).eq("id", projectId);
+    await db
+      .from("clips")
+      .update({ render_url: renderUrl, render_status: "done", render_error: null })
+      .eq("id", clipId);
 
-    return Response.json({ ok: true, clipCount: clipsToInsert.length });
+    return Response.json({ ok: true, renderUrl });
   } catch (err) {
     await db
-      .from("projects")
-      .update({ status: "error", render_error: String(err) })
-      .eq("id", projectId);
+      .from("clips")
+      .update({ render_status: "error", render_error: String(err) })
+      .eq("id", clipId);
     return Response.json({ error: String(err) }, { status: 500 });
   }
+}
+
+async function uploadRawToCloudinary(content, publicId) {
+  const cloud = process.env.CLOUDINARY_CLOUD_NAME;
+  const formData = new FormData();
+  const blob = new Blob([content], { type: "text/plain" });
+  formData.append("file", blob, `${publicId}.srt`);
+  formData.append("public_id", publicId);
+  formData.append("resource_type", "raw");
+  formData.append("api_key", process.env.CLOUDINARY_API_KEY);
+  formData.append("timestamp", String(Math.floor(Date.now() / 1000)));
+  // Catatan: untuk produksi, tanda tangani request ini di server (signed upload),
+  // jangan expose api_secret ke client. Di sini sudah dipanggil dari server (API route), aman.
+
+  const res = await fetch(`https://api.cloudinary.com/v1_1/${cloud}/raw/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) throw new Error("Gagal upload subtitle ke Cloudinary.");
+  return res.json();
 }
