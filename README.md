@@ -36,3 +36,4 @@ Kode ini asli (bukan AI builder), jadi kamu yang pegang penuh. Semua langkah di 
 
 ## Kalau ada error nanti
 Kirim screenshot pesan errornya (dari browser atau dari Vercel > Deployments > Logs) ke Claude, nanti dibantu cari penyebabnya.
+  
